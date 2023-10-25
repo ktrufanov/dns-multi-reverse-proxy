@@ -7,11 +7,12 @@ Since the upstream servers will not see the real client IPs but the proxy,
 you can specify a list of IPs allowed to transfer (AXFR/IXFR).
 
 Example usage:
-        $ go run dns_reverse_proxy.go -address :53 \
-                -default 8.8.8.8:53 \
-                -route .example.com.=8.8.4.4:53 \
-                -route .example2.com.=8.8.4.4:53,1.1.1.1:53 \
-                -allow-transfer 1.2.3.4,::1
+
+	$ go run dns_reverse_proxy.go -address :53 \
+	        -default 8.8.8.8:53 \
+	        -route .example.com.=8.8.4.4:53 \
+	        -route .example2.com.=8.8.4.4:53,1.1.1.1:53 \
+	        -allow-transfer 1.2.3.4,::1
 
 A query for example.net or example.com will go to 8.8.8.8:53, the default.
 However, a query for subdomain.example.com will go to 8.8.4.4:53. -default
@@ -126,13 +127,39 @@ func route(w dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	lcName := strings.ToLower(req.Question[0].Name)
+	var finishResp *dns.Msg
+	finishResp = nil
 	for name, addrs := range routes {
 		if strings.HasSuffix(lcName, name) {
 			addr := addrs[0]
-			if n := len(addrs); n > 1 {
-				addr = addrs[rand.Intn(n)]
+			collectedAddrs := map[string]bool{}
+
+			for n := range addrs {
+				addr = addrs[n]
+
+				resp, err := proxy(addr, w, req)
+				if err != nil {
+					dns.HandleFailed(w, req)
+				}
+				if resp != nil {
+					if finishResp == nil {
+						finishResp = resp
+						for _, d := range resp.Answer {
+							find := strings.Split(d.String(), "\t")[4]
+							collectedAddrs[find] = true
+						}
+					} else {
+						for _, d := range resp.Answer {
+							find := strings.Split(d.String(), "\t")[4]
+							if _, ok := collectedAddrs[find]; !ok {
+								collectedAddrs[find] = true
+								finishResp.Answer = append(finishResp.Answer, d)
+							}
+						}
+					}
+				}
 			}
-			proxy(addr, w, req)
+			w.WriteMsg(finishResp)
 			return
 		}
 	}
@@ -142,7 +169,13 @@ func route(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	proxy(*defaultServer, w, req)
+	resp, err := proxy(*defaultServer, w, req)
+	if err != nil {
+		dns.HandleFailed(w, req)
+	}
+	if resp != nil {
+		w.WriteMsg(resp)
+	}
 }
 
 func isTransfer(req *dns.Msg) bool {
@@ -168,33 +201,31 @@ func allowed(w dns.ResponseWriter, req *dns.Msg) bool {
 	return false
 }
 
-func proxy(addr string, w dns.ResponseWriter, req *dns.Msg) {
+func proxy(addr string, w dns.ResponseWriter, req *dns.Msg) (*dns.Msg, error) {
 	transport := "udp"
 	if _, ok := w.RemoteAddr().(*net.TCPAddr); ok {
 		transport = "tcp"
 	}
 	if isTransfer(req) {
 		if transport != "tcp" {
-			dns.HandleFailed(w, req)
-			return
+			return nil, fmt.Errorf("trnasfer only by tcp")
 		}
 		t := new(dns.Transfer)
 		c, err := t.In(req, addr)
 		if err != nil {
-			dns.HandleFailed(w, req)
-			return
+			return nil, err
 		}
 		if err = t.Out(w, req, c); err != nil {
-			dns.HandleFailed(w, req)
-			return
+			return nil, err
 		}
-		return
+		return nil, nil
 	}
 	c := &dns.Client{Net: transport}
 	resp, _, err := c.Exchange(req, addr)
 	if err != nil {
-		dns.HandleFailed(w, req)
-		return
+		return nil, err
 	}
-	w.WriteMsg(resp)
+
+	//w.WriteMsg(resp)
+	return resp, nil
 }
